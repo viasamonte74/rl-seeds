@@ -1,0 +1,539 @@
+# =============================================================================
+# SWARM SUBNET CONSTANTS
+# =============================================================================
+# Centralized constants for the Swarm Bittensor subnet. This file contains all
+# configuration values, limits, and parameters used throughout the system.
+# =============================================================================
+
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+# =============================================================================
+# EPOCH
+# =============================================================================
+
+EPOCH_FREEZE_SECONDS = 5400                # 1.5 hours before epoch end — no new evaluations
+
+# =============================================================================
+# NETWORK & COMMUNICATION
+# =============================================================================
+
+FORWARD_SLEEP_SEC = 2.0                 # Pause between validator forward passes (seconds)
+BACKEND_GRACE_PERIOD_SEC = 3600         # Use cached weights for 1h after last successful sync
+WANDB_IDLE_RESTART_SEC = 5 * 3600      # Restart W&B run every 5h when idle
+
+# =============================================================================
+# SIMULATION & PHYSICS
+# =============================================================================
+
+# Core simulation parameters
+SIM_DT = 1/50                           # Physics simulation timestep (50 Hz)
+SOLVER_ITERATIONS = 4                   # PyBullet constraint solver iterations (default 50, reduced for speed)
+SOLVER_MIN_ISLAND_SIZE = 128            # Minimum solver island size (reduces per-island overhead)
+HORIZON_SEC = 60                       # Maximum simulated flight duration (seconds)
+# World generation parameters
+RANDOM_START = True                     # Toggle random starting point generation
+# Camera and rendering settings
+CAMERA_FOV_BASE = 90.0                  # Base field of view (degrees)
+CAMERA_FOV_VARIANCE = 2.0               # FOV randomization range (±degrees)
+# Depth sensor parameters
+DEPTH_NEAR = 0.05                       # PyBullet camera near plane (meters)
+DEPTH_FAR = 30.0                        # PyBullet camera far plane (meters)
+DEPTH_MIN_M = 0.5                       # Minimum useful depth range (meters)
+DEPTH_MAX_M = 20.0                      # Maximum useful depth range (meters)
+
+# SAR families (cf_search_and_rescue, cf_swarm_sar) — sharper, farther depth so a
+# victim is a recognizable shape, plus an on-demand RGB frame the policy can request.
+SAR_DEPTH_RES = 256                     # depth resolution for SAR (vs 128 default)
+SAR_DEPTH_MAX_M = 30.0                  # depth normalization ceiling for SAR (vs 20)
+SAR_RGB_RES = 256                       # on-demand RGB frame resolution
+SAR_RGB_REQUEST_CAP = 40               # per-drone RGB requests allowed per episode
+
+# Search area parameters
+SEARCH_AREA_NOISE_Z = 5.0               # ±5m vertical noise — forces real altitude search
+SEARCH_RADIUS_MIN = 5.0                 # Minimum per-seed search radius (meters)
+SEARCH_RADIUS_MAX = 20.0                # Maximum per-seed search radius (meters), clamped per-seed to what fits the horizon
+# Search-aware time scoring — budget the time to sweep the search disk so a good
+# searcher can still reach a perfect time term. See swarm/validator/reward.py.
+SEARCH_SWEEP_ALPHA = 0.75               # Coverage-overhead factor (~70-80th percentile area search)
+SEARCH_DETECT_WIDTH = 5.1               # Effective downward detection swath (meters): cruise footprint 2*SAFE_Z*tan(FOV/2)=6.0 x 0.85 overlap loss
+SEARCH_LAND_SEC = 2.0                   # Time budgeted to settle/land once the pad is found (seconds)
+SEARCH_TIME_BUFFER = 1.06               # Slack multiplier on the search-aware target time
+SEARCH_FEASIBILITY_MARGIN_SEC = 1.0     # Keep target time this far under the horizon when clamping radius
+# Light randomization parameters
+LIGHT_RANDOMIZATION_ENABLED = True      # Enable random light direction (time of day)
+# Propulsion efficiency
+
+# =============================================================================
+# MODEL & AI EVALUATION
+# =============================================================================
+
+# Model size and validation limits — sourced from submission_policy so the
+# backend and validator agree on the same ceiling.
+from swarm.core.submission_policy import MAX_UNCOMPRESSED_BYTES as _POLICY_MAX_BYTES
+
+MAX_MODEL_BYTES = _POLICY_MAX_BYTES
+
+# Docker worker auto-sizing
+DOCKER_WORKER_MEMORY = "6g"             # Memory limit per Docker worker container
+DOCKER_WORKER_CPUS = "2"                # CPU limit per Docker worker container
+
+
+def available_vcpu_count() -> int:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            count = len(os.sched_getaffinity(0))
+            if count > 0:
+                return int(count)
+    except Exception:
+        pass
+    try:
+        count = os.cpu_count()
+        if count and int(count) > 0:
+            return int(count)
+    except Exception:
+        pass
+    return 1
+
+
+def cpus_per_docker_worker() -> int:
+    """Integer CPUs each docker worker is sized for, derived from DOCKER_WORKER_CPUS."""
+    try:
+        return max(1, int(float(DOCKER_WORKER_CPUS)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def default_docker_worker_count(*, maximum: int | None = None) -> int:
+    """Number of CPU-pinned workers that fit, optionally capped by configuration."""
+    cpu_capacity = max(
+        1,
+        available_vcpu_count() // cpus_per_docker_worker(),
+    )
+    configured_maximum = maximum
+    if configured_maximum is None:
+        raw_maximum = os.getenv("SWARM_MAX_DOCKER_WORKERS")
+        if raw_maximum not in (None, ""):
+            try:
+                configured_maximum = max(1, int(raw_maximum))
+            except (TypeError, ValueError):
+                configured_maximum = None
+    if configured_maximum is None:
+        return cpu_capacity
+    return max(1, min(int(configured_maximum), cpu_capacity))
+
+
+# Docker parallel workers for validator and benchmark evaluation.
+# One worker per `DOCKER_WORKER_CPUS` vCPUs so each worker can be pinned to a
+# dedicated CPU group. SWARM_MAX_DOCKER_WORKERS can impose an operator ceiling;
+# otherwise every complete CPU group becomes a worker slot.
+N_DOCKER_WORKERS = default_docker_worker_count()
+
+# Docker pip package whitelist (approved packages for miner requirements.txt)
+DOCKER_PIP_WHITELIST = {
+    "torch", "torchvision", "torchaudio",
+    "onnx", "onnxruntime", "onnxruntime-gpu",
+    "stable-baselines3", "sb3-contrib",
+    "gymnasium", "gym",
+    "swarm-bullet3", "swarm-drone-gym",
+    "numpy", "scipy", "scikit-learn",
+    "opencv-python", "opencv-python-headless",
+    "pillow", "imageio",
+    "matplotlib",
+    "pyyaml",
+    "tqdm",
+    "einops",
+    "tensorboard",
+    "h5py",
+    "msgpack",
+}
+
+# Per-step RPC timing (miner inference fairness)
+RPC_STEP_TIMEOUT_SEC = 0.500            # Per agent.act() call fallback (seconds)
+RPC_FIRST_STEP_TIMEOUT_SEC = 2.0        # First step grace for model warmup/JIT (seconds)
+RPC_RESET_TIMEOUT_SEC = 5.0             # Max wall-clock for agent.reset() between seeds (seconds)
+RPC_PING_TIMEOUT_SEC = 2.0              # Max wall-clock for agent.ping() health check (seconds)
+RPC_CONNECT_MAX_WAIT_SEC = 60.0         # Total budget to reach a serving RPC agent
+AGENT_STARTUP_WALL_SEC = 30.0           # Budget for the agent to serve after the start gate opens
+RPC_MAX_STRIKES_PER_SEED = 15           # Soft timeouts before failing a seed
+GLOBAL_EVAL_BASE_SEC = 600.0            # Base overhead for global worker timeout (seconds); one-seed validator batches get ~600s wall-clock
+GLOBAL_EVAL_PER_SEED_SEC = 15.0         # Per-seed budget in global worker timeout (seconds)
+GLOBAL_EVAL_CAP_SEC = 600.0             # Hard upper bound for global worker timeout (seconds)
+
+# Hardware-fair calibrated timing
+MINER_COMPUTE_BUDGET_SEC = 0.600        # Guaranteed pure-compute budget per step (seconds)
+CALIBRATION_ROUNDS = 10                 # Number of round-trips to measure RPC overhead
+CALIBRATION_OVERHEAD_CAP_SEC = 0.100    # Max acceptable pipeline overhead (seconds)
+CALIBRATION_TIMEOUT_SEC = 5.0           # Per-round calibration timeout (seconds)
+CALIBRATION_BENCHMARK_REF_NS = 15_000_000 # Reference CPU benchmark time (ns) — 3×(512×512) matmul, single-thread
+CALIBRATION_MARGIN_SEC = 0.015          # Safety margin for response deserialization jitter (seconds)
+CALIBRATION_RECAL_INTERVAL = 100        # Re-calibrate every N seeds to catch thermal throttling
+CALIBRATION_WARN_OVERHEAD_MS = 30.0     # Log warning when calibrated overhead exceeds this (ms)
+CALIBRATION_WARN_CPU_FACTOR = 1.5       # Log warning when CPU factor exceeds this
+EVAL_SUMMARY_INTERVAL_SEC = 60          # Periodic evaluation progress summary interval (seconds)
+
+# Reference-time normalization (baseline-relative, hardware-fair per-act scoring)
+SPEED_FACTOR_MIN = 1.0                   # Scoring floor: a fast host never shrinks the guaranteed per-step budget
+SPEED_FACTOR_MAX_ELIGIBLE = 3.0          # Beyond this the host is too slow to score fairly; it self-excludes
+HARD_CAP_REF_SEC = 2.0                   # Per-act liveness ceiling; must remain above the normal compute budget
+HARD_CAP_MARGIN_SEC = 0.050              # Transport-jitter margin added to the per-act hard cap (seconds)
+HARD_CAP_STRIKES_PER_SEED = 3            # Hard-cap timeouts allowed before failing the seed
+FIRST_STEP_BUDGET_REF_SEC = 2.0          # Baseline-equivalent compute budget for the first act (warmup/JIT)
+FIRST_STEP_HARD_CAP_REF_SEC = 3.0        # Per-act hard cap for the first act in baseline-equivalent seconds
+
+# Model storage and processing
+MODEL_DIR = Path("miner_models_v2")     # Directory for storing miner model files
+BLACKLIST_FILE = MODEL_DIR / "fake_models_blacklist.txt"  # Blacklisted model hashes file
+SUBPROC_MEM_MB = 8192                   # Memory limit per evaluation subprocess (MB)
+
+# =============================================================================
+# DRONE & FLIGHT CONTROL
+# =============================================================================
+
+# Drone physical specifications
+DRONE_HULL_RADIUS = 0.12                    # Drone hull radius from center to edge (meters)
+ALTITUDE_RAY_INSET = 0.09                   # Inset from hull edge for altitude ray origin (meters)
+MAX_RAY_DISTANCE = 20.0                     # Downward LiDAR maximum detection range (meters)
+
+# Drone start positioning
+START_PLATFORM_TAKEOFF_BUFFER = 0.121   # Initial clearance above the surface (meters)
+
+# Start / goal platform geometry
+START_PLATFORM = True                   # Enable solid start platform spawn
+START_PLATFORM_RADIUS = 0.6
+START_PLATFORM_HEIGHT = 0.2             # Physical height of the start platform (meters)
+START_PLATFORM_SURFACE_Z = 0.2          # Default absolute Z of the platform surface (meters)
+START_PLATFORM_RANDOMIZE = True         # Randomize platform height when a random start is used
+START_PLATFORM_MIN_Z = 0.2              # Min platform surface height when randomizing (meters)
+START_PLATFORM_MAX_Z = 10               # Max platform surface height when randomizing (meters)
+LANDING_PLATFORM_RADIUS = 0.6           # Landing platform acceptance radius (meters)
+
+# Landing detection parameters
+LANDING_MAX_VZ = 0.5                    # Max vertical velocity for a valid landing (m/s)
+LANDING_MAX_VXY_REL = 0.6               # Max horizontal velocity relative to platform (m/s)
+LANDING_MAX_TILT_RAD = 0.26             # Max roll/pitch for a valid landing (~15 degrees)
+LANDING_STABLE_SEC = 0.5                # Required stable contact duration for success (seconds)
+LANDING_FLOOR_MAX_HEIGHT = 0.15         # Max AABB z-extent treated as floor (meters)
+LANDING_COLUMN_PADDING = 0.10           # XY padding around landing radius (meters)
+LANDING_ALTITUDE_BUFFER = 0.10          # Vertical slack above safe distance (meters)
+
+HOVER_SEC = 0                           # Legacy field kept until reward.py drops it
+SPEED_LIMIT = 3.0                       # Maximum drone velocity limit (m/s)
+MAX_YAW_RATE = 3.141                    # Maximum yaw rotation rate (rad/s)
+ACTION_QUANT_STEP = 2.0 ** -20          # Action quantisation so validators agree bit-for-bit
+GOAL_AREA_CLEARANCE = 0.6               # Required clearance from buildings/obstacles at the goal XY (meters)
+
+# Goal generation ranges
+SAFE_ZONE_RADIUS = 2.0                  # Minimum clearance around obstacles (meters)
+MAX_ATTEMPTS_PER_OBS = 100              # Maximum retry attempts when placing obstacles
+# Goal platform colors
+GOAL_COLOR_PALETTE = [
+    [0.0, 0.8, 0.0, 1.0],               # Green (original)
+    [0.0, 0.0, 0.9, 1.0],               # Blue
+    [0.9, 0.0, 0.0, 1.0],               # Red
+    [0.9, 0.9, 0.0, 1.0],               # Yellow
+    [0.6, 0.0, 0.8, 1.0],               # Purple
+    [0.0, 0.8, 0.8, 1.0],               # Cyan
+    [0.9, 0.5, 0.0, 1.0],               # Orange
+]
+# City variant distribution
+CITY_VARIANT_DISTRIBUTION = {
+    1: 0.10,  # Residential
+    2: 0.25,  # Mixed
+    3: 0.35,  # Urban
+    4: 0.30,  # Hard Mode (city_type=3, difficulty=3)
+}
+
+assert abs(sum(CITY_VARIANT_DISTRIBUTION.values()) - 1.0) < 0.001, "City variant probabilities must sum to 1.0"
+
+# =============================================================================
+# SCORING & REWARDS
+# =============================================================================
+
+# Miner sampling and evaluation
+# Emission burning
+UID_ZERO = 0                            # Burn UID: receives every emission slice not paid to a miner
+
+# Safety metric parameters
+REWARD_W_SUCCESS = 0.45                 # Weight for success term in reward calculation
+REWARD_W_TIME = 0.45                    # Weight for time efficiency term in reward calculation
+REWARD_W_SAFETY = 0.10                  # Weight for safety term in reward calculation
+SAFETY_DISTANCE_SAFE = 1.0              # Full safety score at this clearance (meters)
+SAFETY_DISTANCE_DANGER = 0.2            # Zero safety score at this clearance (meters)
+
+# =============================================================================
+# BENCHMARK SYSTEM
+# =============================================================================
+
+from swarm import version_split as _vs
+BENCHMARK_VERSION = ".".join(_vs[:3])
+BENCHMARK_TOTAL_SEED_COUNT = 1100       # Total seeds per epoch
+BENCHMARK_SCREENING_SEED_COUNT = 300    # Seeds used for screening phase
+BENCHMARK_FULL_SEED_COUNT = 800         # Seeds used for full benchmark phase
+SCREENING_BOOTSTRAP_THRESHOLD = 0.01    # Minimum score threshold during bootstrap
+
+# Epoch system — seeds rotate every 7 days (Monday 16:00 UTC)
+EPOCH_DURATION_SECONDS = 7 * 86400
+EPOCH_ANCHOR_UTC = datetime(2026, 3, 30, 16, 0, 0, tzinfo=timezone.utc)
+# Piecewise so past epochs keep their numbers; must match the backend schedule exactly.
+EPOCH_SWITCH_NUMBER = 19
+EPOCH_DURATION_LONG_SECONDS = 14 * 86400
+EPOCH_SWITCH_TS = EPOCH_ANCHOR_UTC.timestamp() + (EPOCH_SWITCH_NUMBER - 1) * EPOCH_DURATION_SECONDS
+
+# Early screening termination — abort screening when outcome is statistically certain
+
+# Fair screening early-stop: reject a candidate only when an optimistic one-sided
+# bound on its mean still cannot reach the champion bar. Checkpoint -> z value
+# (family-wise across the expected per-epoch model count). The 50 look is gentle
+# (catches only clearly-hopeless models); 100 and 150 tighten as evidence grows.
+
+# Champion-copy detection on shared seeds. Metrics are logged on every check; the
+# hard-stop fires only for near-identical clones (calibrate before tightening).
+
+# Upload group size for streamed seed scores across screening, benchmark, and
+# reeval; smaller groups give fresher UI updates at the cost of more uploads.
+UNIFIED_CHUNK_SIZE = 10
+MAX_INFLIGHT_SEED_UPLOADS = 3
+RE_AUTH_INTERVAL_SEC = 60.0
+
+# =============================================================================
+# SAR (Search-and-Rescue) thresholds and scoring constants
+# =============================================================================
+
+SAR_CONFIRM_HORIZ_RADIUS = 2.0       # m — horizontal distance to victim for CONFIRMED
+SAR_HOVER_BAND = (2.0, 4.0)          # m — height above victim AABB top
+SAR_CONFIRM_SPEED_MAX = 1.0          # m/s — max drone speed for CONFIRMED
+SAR_HYSTERESIS_GRACE = 0.1           # m / m·s⁻¹ — boundary grace
+SAR_NO_TOUCH_RADIUS = 0.8            # m — terminal-failure sphere around victim
+SAR_DWELL_SEC = 2.0                  # s — continuous predicate hold required
+SAR_SEARCH_RADIUS = 30.0             # m — search clue circle radius
+SAR_MAX_VICTIM_DISTANCE_M = 80.0     # m — cap victim spawn distance from the drone start so tasks stay solvable within the horizon
+SAR_SWEEP_WIDTH = 24.0               # m — assumed sweep width for target-time
+SAR_TIME_TERM_BUFFER = 1.03          # multiplier on the Candidate-C target time
+
+
+def _build_sar_screening_template() -> list[dict]:
+    slots: list[dict] = []
+    city_slot      = dict(challenge_type=1, distance_range=(15, 25))
+    open_slot      = dict(challenge_type=2, distance_range=(14, 20))
+    mountain_slot  = dict(challenge_type=3, distance_range=(30, 55))
+    village_slot   = dict(challenge_type=4, distance_range=(25, 45))
+    warehouse_slot = dict(challenge_type=5, distance_range=(10, 22))
+    forest_slot    = dict(challenge_type=6, distance_range=(15, 28))
+
+    pools = [
+        [city_slot]      * 8,
+        [open_slot]      * 8,
+        [mountain_slot]  * 8,
+        [village_slot]   * 9,
+        [warehouse_slot] * 9,
+        [forest_slot]    * 8,
+    ]
+    for i in range(max(len(p) for p in pools)):
+        for pool in pools:
+            if i < len(pool):
+                slots.append(pool[i])
+
+    if len(slots) != 50:
+        raise RuntimeError(f"SAR screening template must have 50 entries, got {len(slots)}")
+    return slots
+
+
+SAR_SCREENING_TEMPLATE: list[dict] = _build_sar_screening_template()
+
+# =============================================================================
+# CHALLENGE TYPE DISTRIBUTION
+# =============================================================================
+
+CHALLENGE_TYPE_DISTRIBUTION = {
+    1: 1 / 6,  # City navigation (procedural roads)
+    2: 1 / 6,  # Open flight (no obstacles)
+    3: 1 / 6,  # Mountain navigation
+    4: 1 / 6,  # Village navigation
+    5: 1 / 6,  # Warehouse navigation
+    6: 1 / 6,  # Forest navigation
+}
+
+assert abs(sum(CHALLENGE_TYPE_DISTRIBUTION.values()) - 1.0) < 0.001, "Challenge probabilities must sum to 1.0"
+
+# =============================================================================
+# CHALLENGE TYPE PARAMETERS
+# =============================================================================
+
+# Type 1: City Navigation
+TYPE_1_WORLD_RANGE = 75
+TYPE_1_R_MIN, TYPE_1_R_MAX = 22, 45
+TYPE_1_H_MIN, TYPE_1_H_MAX = 0.2, 1
+TYPE_1_START_H_MIN, TYPE_1_START_H_MAX = 0.2, 5
+TYPE_1_HORIZON = HORIZON_SEC
+
+# Type 2: Open Flight (No Obstacles)
+TYPE_2_WORLD_RANGE = 60
+TYPE_2_N_OBSTACLES = 0
+TYPE_2_HEIGHT_SCALE = 1.0
+TYPE_2_SAFE_ZONE = 0.0
+TYPE_2_R_MIN, TYPE_2_R_MAX = 28, 72
+TYPE_2_H_MIN, TYPE_2_H_MAX = 4, 14
+TYPE_2_START_H_MIN, TYPE_2_START_H_MAX = 0.05, 10
+TYPE_2_HORIZON = HORIZON_SEC
+
+# Type 3: Mountain Navigation
+TYPE_3_R_MIN, TYPE_3_R_MAX = 65, 100
+TYPE_3_H_MIN, TYPE_3_H_MAX = 0, 0
+TYPE_3_START_H_MIN, TYPE_3_START_H_MAX = 0, 0
+TYPE_3_HORIZON = HORIZON_SEC
+TYPE_3_SCALE_MIN = 0.6
+TYPE_3_SCALE_MAX = 0.8
+TYPE_3_SCALE_SEED_OFFSET = 777777
+TYPE_3_WORLD_RANGE_RATIO = 0.60
+TYPE_3_VILLAGE_RANGE = 40.0
+# Village (challenge_type 4) keeps its own far-goal band — its ±40m world box
+# caps reachable distance near 56m, so it must NOT inherit the mountain 50-100 band.
+VILLAGE_R_MIN, VILLAGE_R_MAX = 28, 56
+
+# Legacy split kept for compatibility utilities. Internal task schema now uses:
+# type=3 mountain, type=4 village.
+MOUNTAIN_SUBTYPE_DISTRIBUTION = {
+    1: 0.75,  # Mountains Only
+    2: 0.25,  # Ski Village
+}
+
+# Type 5: Warehouse Navigation (rectangular: 80.2m × 50.6m floor, 12m ceiling)
+# Constants retain the TYPE_4_* prefix for backward import compatibility.
+TYPE_4_WORLD_RANGE_X = 38                           # ±38m X (floor_spawn_half_x=40.1m, 2m wall margin)
+TYPE_4_WORLD_RANGE_Y = 23                           # ±23m Y (floor_spawn_half_y=25.3m, 2m wall margin)
+TYPE_4_R_MIN, TYPE_4_R_MAX = 18, 35
+TYPE_4_H_MIN, TYPE_4_H_MAX = 0.2, 10.0             # Floor to roof(12m) minus 2m ceiling clearance
+TYPE_4_START_H_MIN, TYPE_4_START_H_MAX = 0.2, 10.0
+TYPE_4_HORIZON = HORIZON_SEC
+TYPE_4_PLATFORM_CLEARANCE = 1.0                     # Minimum clearance from warehouse structures (meters)
+TYPE_4_PLATFORM_MAX_ATTEMPTS = 200                  # Max attempts to find collision-free platform position
+
+# Type 6: Forest Navigation (100×100m ground, 96×96m playable with 2m edge margin)
+TYPE_6_WORLD_RANGE = 42                             # ±42m playable XY (96m total with margin)
+TYPE_6_R_MIN, TYPE_6_R_MAX = 22, 45
+TYPE_6_H_MIN, TYPE_6_H_MAX = 0.2, 3.0
+TYPE_6_START_H_MIN, TYPE_6_START_H_MAX = 0.2, 3.0
+TYPE_6_HORIZON = HORIZON_SEC
+TYPE_6_SAFETY_DISTANCE_SAFE = 0.6                   # Tighter safety for dense forest (meters)
+
+# Per-challenge override for SAFETY_DISTANCE_SAFE; types not present fall back
+# to the global value.
+SAFETY_DISTANCE_SAFE_BY_TYPE = {
+    6: TYPE_6_SAFETY_DISTANCE_SAFE,
+}
+
+FOREST_MODE_DISTRIBUTION = {
+    1: 0.25,   # Normal (green foliage)
+    2: 0.25,   # Autumn (orange/yellow)
+    3: 0.25,   # Snow (white, bare + snow-covered)
+    4: 0.25,   # Dead (no leaves, bare branches)
+}
+FOREST_DIFFICULTY_DISTRIBUTION = {
+    1: 0.45,   # Easy  (130 trees, loose spacing)
+    2: 0.35,   # Normal (170 trees, medium spacing)
+    3: 0.20,   # Hard  (210 trees, tight spacing)
+}
+assert abs(sum(FOREST_MODE_DISTRIBUTION.values()) - 1.0) < 0.001
+assert abs(sum(FOREST_DIFFICULTY_DISTRIBUTION.values()) - 1.0) < 0.001
+
+# =============================================================================
+# MOVING PLATFORM (challenge variant, applies to any map type)
+# =============================================================================
+
+MOVING_PLATFORM_PROB = {
+    1: 0.25,
+    2: 0.80,
+    3: 0.25,
+    4: 0.25,
+    5: 0.00,
+    6: 0.00,
+}
+MOVING_PLATFORM_SEED_OFFSET = 555555
+
+# Swarm autopilot (cf_swarm_autopilot): N drones flown by one centralized policy.
+SWARM_NUM_DRONES = 5                      # reference / smoke default
+SWARM_MIN_DRONES = 2                      # per-seed drone count is random in [MIN, MAX]
+SWARM_MAX_DRONES = 8
+SWARM_NEIGHBOR_K = SWARM_MAX_DRONES - 1   # fixed neighbour slots so the obs row is constant
+SWARM_COUNT_SEED_OFFSET = 246810          # distinct from layout / moving-platform offsets
+SWARM_LAYOUT_SEED_OFFSET = 313131         # distinct from MOVING_PLATFORM_SEED_OFFSET
+SWARM_PAD_MIN_SPACING = 4.0               # min XY metres between any two start (or goal) pads
+SWARM_PAD_MAX_ATTEMPTS = 100              # deterministic rejection-sampling cap per pad
+SWARM_CONGESTION_PER_NEIGHBOR_SEC = 1.0   # time-target slack per congested neighbour
+SWARM_SEARCH_RADIUS = 30.0                # m — shared search-clue radius (bigger than autopilot's 10)
+SWARM_SAR_SEARCH_RADIUS = 80.0            # m — shared SAR search-clue radius for the swarm (vs single-drone 30)
+
+# =============================================================================
+# INTERCEPTOR (cf_interceptor) — air-to-air pursuit, this family only
+# =============================================================================
+INTERCEPTOR_DRONE_URDF = "interceptor_drone.urdf"  # 36 cm drone shipped in swarm/assets
+INTERCEPTOR_DRONE_SCALE = 3                  # cf2x x3 ~= 36 cm diagonal
+
+INTERCEPTOR_MINER_SPEED = 6.0               # m/s — chaser velocity cap (env-local; tune later)
+INTERCEPTOR_MAX_TILT_DEG = 75.0             # deg — pursuit needs more lean than the global 60 cutoff; sustained chase speed stays under the 4.5 flee otherwise
+INTERCEPTOR_TARGET_FLEE_FRAC = 0.75         # target flee speed / chaser speed
+INTERCEPTOR_TARGET_CRUISE_FRAC = 0.45       # target speed when not threatened
+INTERCEPTOR_REACT_RANGE_M = 12.0            # chaser distance that makes the target flee
+INTERCEPTOR_KILL_RADIUS_M = 0.15            # deep-overlap anti-tunnel guard; the catch is a real physical hit
+
+INTERCEPTOR_MIN_START_DISTANCE_M = 60.0     # min chaser-start -> target distance
+INTERCEPTOR_MAX_START_DISTANCE_M = 100.0    # max (random in between)
+INTERCEPTOR_TERRAIN_SIZE_M = 180.0          # open-map terrain extent for this family (vs 80 default)
+INTERCEPTOR_CHASE_CENTER_JITTER_M = 10.0    # the chase midpoint sits within this of the map centre
+INTERCEPTOR_SEARCH_RADIUS_MIN_M = 10.0      # search-area radius (target within this of the hint)
+INTERCEPTOR_SEARCH_RADIUS_MAX_M = 40.0      # random per task, capped here
+INTERCEPTOR_SEARCH_REFRESH_SEC = 2.0        # how often the coarse hint re-samples (radar ping)
+
+INTERCEPTOR_ALT_MIN_M = 3.0                 # target altitude band above local surface
+INTERCEPTOR_ALT_MAX_M = 25.0
+INTERCEPTOR_JINK_GAIN = 0.6                 # lateral break strength when fleeing
+INTERCEPTOR_JINK_FREQ_MIN = 0.3            # Hz (seed-picked)
+INTERCEPTOR_JINK_FREQ_MAX = 1.0
+
+INTERCEPTOR_HULL_RADIUS = DRONE_HULL_RADIUS * INTERCEPTOR_DRONE_SCALE   # 0.36 m
+INTERCEPTOR_START_PAD_RADIUS = START_PLATFORM_RADIUS * INTERCEPTOR_DRONE_SCALE  # pad sized for 36 cm
+INTERCEPTOR_START_PAD_HEIGHT = START_PLATFORM_HEIGHT * INTERCEPTOR_DRONE_SCALE
+INTERCEPTOR_TAKEOFF_BUFFER = START_PLATFORM_TAKEOFF_BUFFER * INTERCEPTOR_DRONE_SCALE
+INTERCEPTOR_TARGET_SELFCRASH_FORCE = 3.0    # N — world-contact force that counts as a target crash
+
+INTERCEPTOR_DEPTH_RES = 1024                 # env-local depth resolution (GPU at deploy)
+INTERCEPTOR_DEPTH_FAR_M = 110.0             # env-local camera far plane (m)
+INTERCEPTOR_DEPTH_MAX_M = 100.0             # env-local depth normalization ceiling (m)
+
+INTERCEPTOR_HORIZON_SEC = 60.0             # episode horizon (matches the other maps; reference catch <= ~49 s)
+INTERCEPTOR_TIME_BUFFER = 1.1              # target-time slack multiplier
+INTERCEPTOR_ACQUIRE_SLACK_SEC = 10.0       # extra par time for visual acquisition
+INTERCEPTOR_W_SUCCESS = 0.5                # score = 0.5 caught + 0.5 time (no safety term)
+INTERCEPTOR_W_TIME = 0.5
+INTERCEPTOR_SEED_OFFSET = 0x1A7E2C70       # evader/clue RNG offset
+
+if not (0.0 <= INTERCEPTOR_TARGET_FLEE_FRAC < 1.0):
+    raise ValueError("INTERCEPTOR_TARGET_FLEE_FRAC must be in [0, 1)")
+if INTERCEPTOR_MINER_SPEED <= 0.0:
+    raise ValueError("INTERCEPTOR_MINER_SPEED must be positive")
+if not (0.0 < INTERCEPTOR_MIN_START_DISTANCE_M <= INTERCEPTOR_MAX_START_DISTANCE_M):
+    raise ValueError("INTERCEPTOR start-distance bounds invalid")
+
+PLATFORM_MOVEMENT_PATTERNS = ["circular", "linear", "figure8"]
+PLATFORM_SPEED_MIN, PLATFORM_SPEED_MAX = 0.6, 1.2
+PLATFORM_RADIUS_MIN, PLATFORM_RADIUS_MAX = 2.0, 4.0
+PLATFORM_DELAY_MIN, PLATFORM_DELAY_MAX = 0.0, 2.0
+PLATFORM_TRANSITION_MIN, PLATFORM_TRANSITION_MAX = 2.5, 3.5
+PLATFORM_LINEAR_DIRECTIONS = ["x", "y", "xy"]
+
+PLATFORM_AVOIDANCE_ENABLED = True
+PLATFORM_STEER_ANGLES = [20, -20, 40, -40, 60, -60, 80, -80, 120, -120, 160, -160, 180]
+PLATFORM_MIN_STEP_M = 0.05
+
+# =============================================================================
+# DISTANCE-BASED CULLING
+# =============================================================================
+
+CULL_VISUAL_RADIUS = 35.0               # Hide visuals beyond this distance (meters)
+CULL_PHYSICS_RADIUS = 50.0              # Disable collision beyond this distance (meters)
+CULL_INTERVAL_STEPS = 5                 # Re-evaluate cull state every N steps
+CULL_MIN_AABB_SPAN = 5.0                # Minimum AABB XY span to be a cull target (meters)
+CULL_MIN_FACES = 100                    # Minimum mesh face count to be a cull target
+CULL_MIN_TOTAL_FACES = 100_000          # Auto-enable threshold (total faces across targets)

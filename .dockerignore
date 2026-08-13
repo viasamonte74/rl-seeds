@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+**/*.pyc
+swarm/assets
+swarm/state
+tests
+docs
+scripts
+Submission
