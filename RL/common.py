@@ -26,12 +26,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
 from swarm.challenge_families import get_challenge_family
@@ -46,6 +43,8 @@ from swarm.policy_interface import resolve_policy_interface_version, smoke_test_
 from swarm.utils.env_factory import make_env_with_initial_obs
 from swarm.validator.task_gen import random_task
 
+from agent_template import InterceptorFeaturesExtractor
+
 _MAX_MAP_SEED = 2**32 - 1
 
 POLICY_DEPTH_SIZE = 64
@@ -57,10 +56,12 @@ DEFAULT_INTERCEPTOR_TIMESTEPS = 500_000
 DEFAULT_SWARM_DRONES = 4
 _MAX_TASK_RESAMPLES = 200
 
-# Closing 1 m of gap → this much extra reward. A 80 m close-in is ~+1.6,
+# Closing 1 m of gap → this much extra reward. An 80 m close-in is ~+1.6,
 # comparable to a catch score (0.5–1.0) so PPO is not dominated by shaping.
 _INTERCEPTOR_CLOSE_REWARD_PER_M = 0.02
 _INTERCEPTOR_SHAPE_CLIP = 0.15
+# Clue resamples every 2 s (up to tens of metres). Ignore that teleport.
+_INTERCEPTOR_CLUE_JUMP_M = 1.5
 
 _DEFAULT_PPO = dict(
     n_steps=512,
@@ -73,51 +74,21 @@ _DEFAULT_PPO = dict(
     max_grad_norm=0.5,
 )
 
-class InterceptorFeaturesExtractor(BaseFeaturesExtractor):
-    """Keep the search clue visible: CNN on NCHW depth, MLP on the 140-d state.
-
-    SB3 CombinedExtractor treats float (256,256,1) as channels-first, so it
-    builds Conv2d(256, ...) on a 256×1 strip and then concatenates a flattened
-    image with the state. The clue (state[138:140]) is drowned and the camera
-    is unused. This extractor permutes HWC→CHW and gives state its own MLP.
-    """
-
-    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
-        super().__init__(observation_space, features_dim)
-        depth_shape = observation_space["depth"].shape
-        state_dim = int(observation_space["state"].shape[0])
-        height, width = int(depth_shape[0]), int(depth_shape[1])
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        with torch.no_grad():
-            n_cnn = int(self.cnn(torch.zeros(1, 1, height, width)).shape[1])
-        self.state_mlp = nn.Sequential(nn.Linear(state_dim, 128), nn.ReLU())
-        self.merge = nn.Sequential(nn.Linear(n_cnn + 128, features_dim), nn.ReLU())
-
-    def forward(self, observations):
-        depth = observations["depth"]
-        if depth.ndim == 4 and depth.shape[-1] == 1:
-            depth = depth.permute(0, 3, 1, 2).contiguous()
-        return self.merge(torch.cat([self.cnn(depth), self.state_mlp(observations["state"])], dim=1))
-
 
 # Chase episodes are 60 s × 50 Hz = 3,000 steps. n_steps=512 only sees ~10 s
-# of a pursuit; 2048 covers ~40 s so GAE can credit a catch. Slight entropy
-# keeps the 5-D velocity command from collapsing to hover.
+# of a pursuit; 2048 covers ~40 s so GAE can credit a catch.
+# target_kl early-stops extra epochs when the policy has already moved; it does
+# not change observations or reward. lr/n_epochs are lower so KL stays ~0.01.
 _INTERCEPTOR_PPO = dict(
     n_steps=2048,
     batch_size=256,
-    n_epochs=10,
+    n_epochs=4,
     gamma=0.995,
     gae_lambda=0.95,
-    ent_coef=0.01,
-    learning_rate=3e-4,
+    ent_coef=0.005,
+    learning_rate=1e-4,
     max_grad_norm=0.5,
+    target_kl=0.03,
     policy_kwargs=dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         features_extractor_class=InterceptorFeaturesExtractor,
@@ -134,12 +105,13 @@ def _policy_depth_size(family_id: str) -> int:
 
 
 def downsample_depth(depth: np.ndarray, size: int) -> np.ndarray:
-    """Block min-pool depth to size×size×1.
+    """Block-pool depth to size×size×1. Must match RL/agent_template.py.
 
-    Env depth is 0=near, 1=far. Min-pool keeps the nearest surface in each
-    block, so a 2–4 px interceptor target still marks the downsampled cell.
-    Stride sampling (``depth[::k, ::k]``) skips those pixels and blinds the
-    policy until the target is huge.
+    Env depth is 0=near, 1=far. Uniform blocks use min-pool (nearest surface)
+    so a few-pixel target against sky survives 1024→256. Mixed ground+sky
+    blocks would otherwise report ground and erase an airborne target; those
+    keep the nearest pixel in the far cluster instead. Other families (64²)
+    always min-pool so nearby obstacles are not dropped.
     """
     d = np.asarray(depth, dtype=np.float32)
     if d.ndim == 3:
@@ -154,7 +126,17 @@ def downsample_depth(depth: np.ndarray, size: int) -> np.ndarray:
     else:
         bh, bw = h // size, w // size
         cropped = d[: size * bh, : size * bw]
-        out = cropped.reshape(size, bh, size, bw).min(axis=(1, 3))
+        blocks = cropped.reshape(size, bh, size, bw).transpose(0, 2, 1, 3)
+        flat = blocks.reshape(size, size, bh * bw)
+        out = flat.min(axis=-1)
+        if size >= INTERCEPTOR_DEPTH_SIZE and bh * bw >= 4:
+            p10 = np.percentile(flat, 10, axis=-1)
+            p90 = np.percentile(flat, 90, axis=-1)
+            mixed = (p90 - p10) > 0.25
+            if np.any(mixed):
+                mid = p10 + 0.5 * (p90 - p10)
+                far_only = np.where(flat >= mid[..., None], flat, 1.0)
+                out = np.where(mixed, far_only.min(axis=-1), out)
     return np.ascontiguousarray(out.reshape(size, size, 1), dtype=np.float32)
 
 
@@ -217,6 +199,7 @@ class FamilyVecEnv(VecEnv):
         self._env, first_obs = self._build_episode()
         self._depth_size = _policy_depth_size(family_id)
         self._prev_chase_dist: float | None = None
+        self._prev_clue_dist: float | None = None
         self._ep_return = 0.0
         self._ep_len = 0
 
@@ -304,12 +287,38 @@ class FamilyVecEnv(VecEnv):
         cpos = np.asarray(chaser[0:3], dtype=np.float64)
         return float(np.linalg.norm(cpos - np.asarray(tpos, dtype=np.float64)))
 
-    def _shape_interceptor_reward(self, base_reward: float, info: dict, done: bool) -> float:
-        """Potential-based shaping on current range, plus validator score-delta.
+    def _clue_range(self, obs: dict[str, np.ndarray]) -> float | None:
+        state = obs.get("state")
+        if state is None:
+            return None
+        vec = np.asarray(state, dtype=np.float64)
+        if vec.ndim == 2:
+            vec = vec[0]
+        if vec.shape[-1] < 2:
+            return None
+        return float(np.linalg.norm(vec[-2:]))
 
-        Until a catch, evaluate_rollout stays at participation (~0.01), so the
-        score delta is ~0 for thousands of steps. Closing the live gap is the
-        actual chase signal.
+    def _shape_delta(self, prev: float, current: float) -> float:
+        return float(
+            np.clip(
+                _INTERCEPTOR_CLOSE_REWARD_PER_M * (prev - current),
+                -_INTERCEPTOR_SHAPE_CLIP,
+                _INTERCEPTOR_SHAPE_CLIP,
+            )
+        )
+
+    def _shape_interceptor_reward(
+        self,
+        base_reward: float,
+        info: dict,
+        done: bool,
+        obs: dict[str, np.ndarray],
+    ) -> float:
+        """Potential-based shaping on live range and the search clue.
+
+        Until a catch, evaluate_rollout stays at participation (~0.01). Closing
+        the true gap teaches pursuit; closing the clue (state[-2:]) teaches
+        yaw/fly toward the hint. Clue teleports every 2 s — skip that step.
         """
         dist = self._current_chase_dist()
         if dist is None:
@@ -318,21 +327,26 @@ class FamilyVecEnv(VecEnv):
         shaped = float(base_reward)
         if dist is not None and np.isfinite(dist):
             if self._prev_chase_dist is not None:
-                delta = self._prev_chase_dist - dist
-                shaped += float(
-                    np.clip(
-                        _INTERCEPTOR_CLOSE_REWARD_PER_M * delta,
-                        -_INTERCEPTOR_SHAPE_CLIP,
-                        _INTERCEPTOR_SHAPE_CLIP,
-                    )
-                )
+                shaped += self._shape_delta(self._prev_chase_dist, dist)
             self._prev_chase_dist = dist
+
+        clue = self._clue_range(obs)
+        if clue is not None and np.isfinite(clue):
+            if (
+                self._prev_clue_dist is not None
+                and abs(clue - self._prev_clue_dist) < _INTERCEPTOR_CLUE_JUMP_M
+            ):
+                shaped += self._shape_delta(self._prev_clue_dist, clue)
+            self._prev_clue_dist = clue
+
         if done:
             self._prev_chase_dist = None
+            self._prev_clue_dist = None
         return shaped
 
     def reset(self):
         self._prev_chase_dist = None
+        self._prev_clue_dist = None
         self._ep_return = 0.0
         self._ep_len = 0
         return self._stack_obs(self._last_obs)
@@ -350,7 +364,7 @@ class FamilyVecEnv(VecEnv):
 
         shaped = float(reward)
         if self._family_id == "cf_interceptor":
-            shaped = self._shape_interceptor_reward(shaped, info, done)
+            shaped = self._shape_interceptor_reward(shaped, info, done, obs)
 
         self._ep_return += shaped
         self._ep_len += 1
@@ -379,6 +393,7 @@ class FamilyVecEnv(VecEnv):
             self._ep_return = 0.0
             self._ep_len = 0
             self._prev_chase_dist = None
+            self._prev_clue_dist = None
         else:
             self._last_obs = obs
 
@@ -605,6 +620,14 @@ def train_family(family_id: str, *, supports_drone_count: bool = False) -> None:
             device=args.device,
             tensorboard_log=tb_log,
             **ppo_kw,
+        )
+
+    if family_id == "cf_interceptor":
+        print(
+            "Interceptor PPO: target_kl="
+            f"{ppo_kw.get('target_kl')} lr={ppo_kw.get('learning_rate')} "
+            f"n_epochs={ppo_kw.get('n_epochs')} (KL early-stop only; "
+            "obs/reward unchanged). Do not resume a pre-fix checkpoint."
         )
 
     callbacks: list[BaseCallback] = [EpisodeStatCallback(log_every=5)]
