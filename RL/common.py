@@ -26,9 +26,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
 from swarm.challenge_families import get_challenge_family
@@ -70,6 +73,39 @@ _DEFAULT_PPO = dict(
     max_grad_norm=0.5,
 )
 
+class InterceptorFeaturesExtractor(BaseFeaturesExtractor):
+    """Keep the search clue visible: CNN on NCHW depth, MLP on the 140-d state.
+
+    SB3 CombinedExtractor treats float (256,256,1) as channels-first, so it
+    builds Conv2d(256, ...) on a 256×1 strip and then concatenates a flattened
+    image with the state. The clue (state[138:140]) is drowned and the camera
+    is unused. This extractor permutes HWC→CHW and gives state its own MLP.
+    """
+
+    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        depth_shape = observation_space["depth"].shape
+        state_dim = int(observation_space["state"].shape[0])
+        height, width = int(depth_shape[0]), int(depth_shape[1])
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            n_cnn = int(self.cnn(torch.zeros(1, 1, height, width)).shape[1])
+        self.state_mlp = nn.Sequential(nn.Linear(state_dim, 128), nn.ReLU())
+        self.merge = nn.Sequential(nn.Linear(n_cnn + 128, features_dim), nn.ReLU())
+
+    def forward(self, observations):
+        depth = observations["depth"]
+        if depth.ndim == 4 and depth.shape[-1] == 1:
+            depth = depth.permute(0, 3, 1, 2).contiguous()
+        return self.merge(torch.cat([self.cnn(depth), self.state_mlp(observations["state"])], dim=1))
+
+
 # Chase episodes are 60 s × 50 Hz = 3,000 steps. n_steps=512 only sees ~10 s
 # of a pursuit; 2048 covers ~40 s so GAE can credit a catch. Slight entropy
 # keeps the 5-D velocity command from collapsing to hover.
@@ -82,7 +118,12 @@ _INTERCEPTOR_PPO = dict(
     ent_coef=0.01,
     learning_rate=3e-4,
     max_grad_norm=0.5,
-    policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
+    policy_kwargs=dict(
+        net_arch=dict(pi=[256, 256], vf=[256, 256]),
+        features_extractor_class=InterceptorFeaturesExtractor,
+        features_extractor_kwargs=dict(features_dim=256),
+        normalize_images=False,
+    ),
 )
 
 
@@ -175,7 +216,7 @@ class FamilyVecEnv(VecEnv):
         self._last_map_seed: int | None = None
         self._env, first_obs = self._build_episode()
         self._depth_size = _policy_depth_size(family_id)
-        self._prev_min_dist: float | None = None
+        self._prev_chase_dist: float | None = None
         self._ep_return = 0.0
         self._ep_len = 0
 
@@ -248,19 +289,36 @@ class FamilyVecEnv(VecEnv):
             for key in ("depth", "state")
         }
 
+    def _current_chase_dist(self) -> float | None:
+        """Live chaser→target range. Do not use intercept_min_dist for this.
+
+        intercept_min_dist is a running episode minimum: it only falls, never
+        rises, so shaping on it is 0 on most steps and never punishes flying
+        away. The target's own cruise can also lower the running min while the
+        chaser hovers, which is the ~73 m plateau in the logs.
+        """
+        tpos = getattr(self._env, "_target_pos", None)
+        if tpos is None:
+            return None
+        chaser = self._env._getDroneStateVector(0)
+        cpos = np.asarray(chaser[0:3], dtype=np.float64)
+        return float(np.linalg.norm(cpos - np.asarray(tpos, dtype=np.float64)))
+
     def _shape_interceptor_reward(self, base_reward: float, info: dict, done: bool) -> float:
-        """Add dense closing-distance reward on top of validator score-delta.
+        """Potential-based shaping on current range, plus validator score-delta.
 
         Until a catch, evaluate_rollout stays at participation (~0.01), so the
-        score delta is ~0 for thousands of steps. Closing intercept_min_dist is
-        the actual chase signal.
+        score delta is ~0 for thousands of steps. Closing the live gap is the
+        actual chase signal.
         """
-        dist = info.get("intercept_min_dist")
+        dist = self._current_chase_dist()
+        if dist is None:
+            raw = info.get("intercept_min_dist")
+            dist = float(raw) if raw is not None and np.isfinite(raw) else None
         shaped = float(base_reward)
         if dist is not None and np.isfinite(dist):
-            dist_f = float(dist)
-            if self._prev_min_dist is not None:
-                delta = self._prev_min_dist - dist_f
+            if self._prev_chase_dist is not None:
+                delta = self._prev_chase_dist - dist
                 shaped += float(
                     np.clip(
                         _INTERCEPTOR_CLOSE_REWARD_PER_M * delta,
@@ -268,13 +326,13 @@ class FamilyVecEnv(VecEnv):
                         _INTERCEPTOR_SHAPE_CLIP,
                     )
                 )
-            self._prev_min_dist = dist_f
+            self._prev_chase_dist = dist
         if done:
-            self._prev_min_dist = None
+            self._prev_chase_dist = None
         return shaped
 
     def reset(self):
-        self._prev_min_dist = None
+        self._prev_chase_dist = None
         self._ep_return = 0.0
         self._ep_len = 0
         return self._stack_obs(self._last_obs)
@@ -320,7 +378,7 @@ class FamilyVecEnv(VecEnv):
             self._env, self._last_obs = self._build_episode()
             self._ep_return = 0.0
             self._ep_len = 0
-            self._prev_min_dist = None
+            self._prev_chase_dist = None
         else:
             self._last_obs = obs
 
